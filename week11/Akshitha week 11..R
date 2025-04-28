@@ -1,0 +1,229 @@
+library(mlbench)
+library(purrr)
+
+data("PimaIndiansDiabetes2")
+ds <- as.data.frame(na.omit(PimaIndiansDiabetes2))
+## fit a logistic regression model to obtain a parametric equation
+logmodel <- glm(diabetes ~ .,
+                data = ds,
+                family = "binomial")
+summary(logmodel)
+
+cfs <- coefficients(logmodel) ## extract the coefficients
+prednames <- variable.names(ds)[-9] ## fetch the names of predictors in a vector
+prednames
+
+sz <- 100000000 ## to be used in sampling
+##sample(ds$pregnant, size = sz, replace = T)
+
+dfdata <- map_dfc(prednames,
+                  function(nm){ ## function to create a sample-with-replacement for each pred.
+                    eval(parse(text = paste0("sample(ds$",nm,
+                                             ", size = sz, replace = T)")))
+                  }) ## map the sample-generator on to the vector of predictors
+## and combine them into a dataframe
+
+names(dfdata) <- prednames
+dfdata
+
+class(cfs[2:length(cfs)])
+
+length(cfs)
+length(prednames)
+## Next, compute the logit values
+pvec <- map((1:8),
+            function(pnum){
+              cfs[pnum+1] * eval(parse(text = paste0("dfdata$",
+                                                     prednames[pnum])))
+            }) %>% ## create beta[i] * x[i]
+  reduce(`+`) + ## sum(beta[i] * x[i])
+  cfs[1] ## add the intercept
+
+## exponentiate the logit to obtain probability values of thee outcome variable
+dfdata$outcome <- ifelse(1/(1 + exp(-(pvec))) > 0.5,
+                         1, 0)
+
+install.packages("xgboost")
+library(xgboost)
+library(caret)
+evaluate_xgboost <- function(data, outcome_col, sample_size) {
+  if(sample_size > nrow(data)) {
+    indices <- sample(nrow(data), sample_size, replace = TRUE)
+  } else {
+    indices <- sample(nrow(data), sample_size)
+  }
+  
+  sampled_data <- data[indices, ]
+
+  set.seed(123)
+  train_indices <- createDataPartition(sampled_data[[outcome_col]], p = 0.8, list = FALSE)
+  train_data <- sampled_data[train_indices, ]
+  test_data <- sampled_data[-train_indices, ]
+  
+  train_x <- as.matrix(train_data[, -which(names(train_data) == outcome_col)])
+  train_y <- train_data[[outcome_col]]
+  test_x <- as.matrix(test_data[, -which(names(test_data) == outcome_col)])
+  test_y <- test_data[[outcome_col]]
+  start_time <- Sys.time()
+  dtrain <- xgb.DMatrix(train_x, label = train_y)
+  
+  # Parameters
+  params <- list(
+    objective = "binary:logistic",
+    eval_metric = "logloss",
+    eta = 0.1,
+    max_depth = 6,
+    min_child_weight = 1,
+    subsample = 0.8,
+    colsample_bytree = 0.8
+  )
+  cv_model <- xgb.cv(
+    params = params,
+    data = dtrain,
+    nrounds = 100,
+    nfold = 5,
+    early_stopping_rounds = 10,
+    verbose = 0
+  )
+  
+  best_nrounds <- cv_model$best_iteration
+  model <- xgboost(
+    params = params,
+    data = dtrain,
+    nrounds = best_nrounds,
+    verbose = 0
+  )
+
+  end_time <- Sys.time()
+  time_taken <- difftime(end_time, start_time, units = "secs")
+
+  predictions <- predict(model, test_x)
+  pred_class <- ifelse(predictions > 0.5, 1, 0)
+
+  accuracy <- mean(pred_class == test_y)
+  conf_matrix <- confusionMatrix(factor(pred_class), factor(test_y))
+
+  return(list(
+    method = "XGBoost with 5-fold CV",
+    dataset_size = sample_size,
+    training_size = nrow(train_data),
+    testing_size = nrow(test_data),
+    accuracy = accuracy,
+    sensitivity = conf_matrix$byClass["Sensitivity"],
+    specificity = conf_matrix$byClass["Specificity"],
+    time_seconds = as.numeric(time_taken)
+  ))
+}
+sample_sizes <- c(100, 1000, 10000, 100000, 1000000, 10000000)
+results <- lapply(sample_sizes, function(size) {
+  cat("Processing sample size:", size, "\n")
+  result <- evaluate_xgboost(dfdata, "outcome", size)
+  # Print immediate results
+  cat("Sample size:", size, 
+      "| Accuracy:", round(result$accuracy, 4),
+      "| Time:", round(result$time_seconds, 2), "seconds\n\n")
+  return(result)
+})
+
+result_df <- do.call(rbind, lapply(results, function(r) {
+  data.frame(
+    Method = r$method,
+    Dataset_Size = r$dataset_size,
+    Training_Size = r$training_size,
+    Testing_Size = r$testing_size,
+    Accuracy = round(r$accuracy, 4),
+    Sensitivity = round(r$sensitivity, 4),
+    Specificity = round(r$specificity, 4),
+    Time_Seconds = round(r$time_seconds, 2)
+  )
+}))
+print(result_df)
+
+library(caret)
+library(xgboost)
+evaluate_xgboost_caret <- function(data, outcome_col, sample_size) {
+  if(sample_size > nrow(data)) {
+    indices <- sample(nrow(data), sample_size, replace = TRUE)
+  } else {
+    indices <- sample(nrow(data), sample_size)
+  }
+  
+  sampled_data <- data[indices, ]
+  set.seed(123)
+  train_indices <- createDataPartition(sampled_data[[outcome_col]], p = 0.8, list = FALSE)
+  train_data <- sampled_data[train_indices, ]
+  test_data <- sampled_data[-train_indices, ]
+  train_data[[outcome_col]] <- factor(train_data[[outcome_col]], 
+                                      levels = c(0, 1), 
+                                      labels = c("Class0", "Class1"))
+  test_data[[outcome_col]] <- factor(test_data[[outcome_col]], 
+                                     levels = c(0, 1), 
+                                     labels = c("Class0", "Class1"))
+
+  ctrl <- trainControl(
+    method = "cv",
+    number = 5,
+    verboseIter = FALSE,
+    classProbs = TRUE,
+    summaryFunction = twoClassSummary
+  )
+
+  xgb_grid <- expand.grid(
+    nrounds = 100,
+    eta = 0.1,
+    max_depth = 6,
+    gamma = 0,
+    colsample_bytree = 0.8,
+    min_child_weight = 1,
+    subsample = 0.8
+  )
+  start_time <- Sys.time()
+  model <- train(
+    x = train_data[, -which(names(train_data) == outcome_col)],
+    y = train_data[[outcome_col]],
+    method = "xgbTree",
+    trControl = ctrl,
+    tuneGrid = xgb_grid,
+    metric = "ROC"
+  )
+
+  end_time <- Sys.time()
+  time_taken <- difftime(end_time, start_time, units = "secs")
+  predictions <- predict(model, test_data[, -which(names(test_data) == outcome_col)])
+  accuracy <- sum(predictions == test_data[[outcome_col]]) / nrow(test_data)
+  conf_matrix <- confusionMatrix(predictions, test_data[[outcome_col]])
+
+  return(list(
+    method = "XGBoost via caret with 5-fold CV",
+    dataset_size = sample_size,
+    training_size = nrow(train_data),
+    testing_size = nrow(test_data),
+    accuracy = accuracy,
+    sensitivity = conf_matrix$byClass["Sensitivity"],
+    specificity = conf_matrix$byClass["Specificity"],
+    time_seconds = as.numeric(time_taken)
+  ))
+}
+
+sample_sizes <- c(100, 1000, 10000, 100000, 1000000, 10000000)
+
+results <- list()
+
+for(size in sample_sizes) {
+  cat("Processing sample size:", size, "\n")
+  result <- evaluate_xgboost_caret(dfdata, "outcome", size)
+  results[[as.character(size)]] <- result
+
+  cat("Sample size:", size, 
+      "| Accuracy:", round(result$accuracy, 4),
+      "| Time:", round(result$time_seconds, 2), "seconds\n\n")
+}
+
+result_table <- data.frame(
+  Method = "XGBoost via caret with 5-fold CV",
+  Dataset_Size = sample_sizes,
+  Testing_Performance = sapply(results, function(r) round(r$accuracy, 4)),
+  Time_Seconds = sapply(results, function(r) round(r$time_seconds, 2))
+)
+
+print(result_table)
